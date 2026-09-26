@@ -23,8 +23,8 @@ class TracingService:
         self.store = SpanStore(settings.database_path)
         self.assembler = TraceAssembler(settings.max_pending_wait_ms)
         self.bus = EventBus(settings.graph_push_debounce_seconds)
-        # 重启后从持久化数据重建拼接状态
-        self.assembler.load_from_storage(self.store.all_spans())
+        # 重启后从持久化数据重建拼接状态；等待计时以落库的接收时刻为准连续推进
+        self.assembler.load_from_storage(self.store.all_spans_with_received_at())
 
     # ---------------------------------------------------------------- 上报
 

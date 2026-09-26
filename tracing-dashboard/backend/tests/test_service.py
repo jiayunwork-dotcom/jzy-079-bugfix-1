@@ -8,6 +8,8 @@ import pytest
 from app.config import Settings
 from app.models import SpanRecord
 from app.service import TracingService
+from app.storage import SpanStore
+from app.tree import placeholder_id
 
 
 @pytest.fixture
@@ -32,6 +34,16 @@ def span(
     end: float,
 ) -> SpanRecord:
     return SpanRecord(trace_id, span_id, parent, service_name, start, end, 200)
+
+
+def find_node(nodes: list[dict], span_id: str) -> dict | None:
+    for node in nodes:
+        if node["span_id"] == span_id:
+            return node
+        found = find_node(node["children"], span_id)
+        if found is not None:
+            return found
+    return None
 
 
 class TestGraphWindowSwitching:
@@ -157,3 +169,93 @@ class TestPersistenceReload:
         svc2.close()
         assert tree_after["span_count"] == tree_before["span_count"]
         assert tree_after["critical_path"] == tree_before["critical_path"]
+
+
+class TestRestartPendingState:
+    """重启对等待计时透明：等待状态、剩余等待时间、已超时占位都要连续。"""
+
+    def test_pending_state_consistent_across_restart(self, tmp_path) -> None:
+        """重启前没等满的子片段，重启后仍是等待状态，不会被立刻归入占位节点。"""
+        db = str(tmp_path / "trace.db")
+        cfg = Settings(database_path=db, max_pending_wait_seconds=30)
+        now = now_ms()
+        svc1 = TracingService(cfg)
+        # 片段自带的开始/结束时间比当前早两分钟，模拟攒批延迟上报
+        svc1.ingest(
+            [
+                span("t1", "root", None, "gateway", now - 120_000, now - 119_000),
+                span("t1", "child", "p1", "inventory", now - 120_000, now - 119_500),
+            ]
+        )
+        tree = svc1.get_tree("t1")
+        assert tree["pending_count"] == 1
+        assert not tree["complete"]
+        svc1.close()
+
+        # 数据卷保留，重启后端（距收下远不到 30 秒最长等待）
+        svc2 = TracingService(cfg)
+        tree = svc2.get_tree("t1")
+        svc2.close()
+        assert tree["pending_count"] == 1
+        assert not tree["complete"]
+        placeholder = find_node(tree["roots"], placeholder_id("p1"))
+        assert placeholder is not None
+        assert not placeholder["committed"]
+
+    def test_remaining_wait_runs_continuously_across_restart(self, tmp_path) -> None:
+        """剩余等待时间连续计算：从收下时刻接着算，重启不清零也不提前到期。"""
+        db = str(tmp_path / "trace.db")
+        cfg = Settings(database_path=db, max_pending_wait_seconds=3)
+        now = now_ms()
+        # 落库一条 1 秒前收下的孤儿片段，等价于"收下 1 秒后重启"
+        store = SpanStore(db)
+        store.insert_span(
+            span("t1", "child", "p1", "inventory", now - 120_000, now - 119_500),
+            received_at_ms=now - 1_000,
+        )
+        store.close()
+
+        svc = TracingService(cfg)
+        # 重启后立刻查：仍在等待（才等了 1 秒，最长 3 秒）
+        tree = svc.get_tree("t1")
+        assert tree["pending_count"] == 1
+        assert not tree["complete"]
+        # 从收下算起 3.5 秒：已超时，归入已提交占位节点
+        tree = svc.assembler.build_tree("t1", now_ms=now + 2_500)
+        assert tree["pending_count"] == 0
+        assert tree["complete"]
+        placeholder = find_node(tree["roots"], placeholder_id("p1"))
+        assert placeholder is not None
+        assert placeholder["committed"]
+        svc.close()
+
+    def test_committed_placeholder_survives_restart(self, tmp_path) -> None:
+        """重启前已超时归占位的片段，重启后仍在占位节点下；父片段补到后照常归位。"""
+        db = str(tmp_path / "trace.db")
+        cfg = Settings(database_path=db, max_pending_wait_seconds=3)
+        now = now_ms()
+        # 落库一条 10 秒前收下的孤儿片段：到重启时早已超过 3 秒最长等待
+        store = SpanStore(db)
+        store.insert_span(
+            span("t1", "child", "p1", "inventory", now - 120_000, now - 119_500),
+            received_at_ms=now - 10_000,
+        )
+        store.close()
+
+        svc = TracingService(cfg)
+        tree = svc.get_tree("t1")
+        assert tree["pending_count"] == 0
+        assert tree["complete"]
+        placeholder = find_node(tree["roots"], placeholder_id("p1"))
+        assert placeholder is not None
+        assert placeholder["committed"]
+        assert [c["span_id"] for c in placeholder["children"]] == ["child"]
+
+        # 父片段补报：子片段照旧挪回真实父片段下，占位节点消失
+        svc.ingest([span("t1", "p1", None, "gateway", now - 121_000, now - 119_000)])
+        tree = svc.get_tree("t1")
+        parent = find_node(tree["roots"], "p1")
+        assert parent is not None
+        assert [c["span_id"] for c in parent["children"]] == ["child"]
+        assert find_node(tree["roots"], placeholder_id("p1")) is None
+        svc.close()

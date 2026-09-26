@@ -211,3 +211,98 @@ class TestOrderIndependence:
         assert breakdown["svc-c"]["exclusive_ms"] == 600
         total_pct = sum(b["percent"] for b in tree["service_breakdown"])
         assert abs(total_pct - 100.0) < 0.01
+
+
+class TestRestartRebuild:
+    """重启重建：等待计时对重启透明。
+
+    load_from_storage 模拟重启：片段带各自真实的服务端接收时刻回放。
+    片段自带的开始/结束时间故意写得远早于接收时刻（模拟攒批延迟上报），
+    等待计时只认接收时刻。
+    """
+
+    def test_pending_span_still_waiting_after_restart(self) -> None:
+        """重启前收下、还没等满的子片段，重启后仍然处于等待状态。"""
+        before = TraceAssembler(max_wait_ms=3_000.0)
+        before.add_span(
+            make_span("t1", "child", "p1", "inventory", start=0.0, end=50.0),
+            now_ms=100_000.0,
+        )
+        tree = before.build_tree("t1", now_ms=101_000.0)
+        assert tree["pending_count"] == 1
+        assert not tree["complete"]
+
+        # 收下 1 秒后重启：等待状态原样保留，不能一重启就到期
+        after = TraceAssembler(max_wait_ms=3_000.0)
+        after.load_from_storage(
+            [(make_span("t1", "child", "p1", "inventory", 0.0, 50.0), 100_000.0)],
+            now_ms=101_000.0,
+        )
+        tree = after.build_tree("t1", now_ms=101_000.0)
+        assert tree["pending_count"] == 1
+        assert not tree["complete"]
+        placeholder = find_node(tree["roots"], f"{PLACEHOLDER_PREFIX}p1")
+        assert placeholder is not None
+        assert not placeholder["committed"]
+
+    def test_remaining_wait_runs_continuously_across_restart(self) -> None:
+        """剩余等待时间连续计算：从收下时刻接着算，不提前到期也不重新计满。"""
+        # 最长等待 3 秒，子片段收下 1 秒后重启
+        after = TraceAssembler(max_wait_ms=3_000.0)
+        after.load_from_storage(
+            [(make_span("t1", "child", "p1", "inventory", 0.0, 50.0), 100_000.0)],
+            now_ms=101_000.0,
+        )
+        # 重启后立刻查：仍在等待
+        tree = after.build_tree("t1", now_ms=101_000.0)
+        assert tree["pending_count"] == 1
+        # 从收下算起 2.9 秒：仍未到期（若按片段自带时间计时或重启即到期，
+        # 这里就已经进占位节点了）
+        tree = after.build_tree("t1", now_ms=102_900.0)
+        assert tree["pending_count"] == 1
+        # 从收下算起 3.5 秒：已超时，归入已提交占位节点（若从重启时刻
+        # 重新计满 3 秒，这里还会错误地处于等待状态）
+        tree = after.build_tree("t1", now_ms=103_500.0)
+        assert tree["pending_count"] == 0
+        assert tree["complete"]
+        placeholder = find_node(tree["roots"], f"{PLACEHOLDER_PREFIX}p1")
+        assert placeholder is not None
+        assert placeholder["committed"]
+        assert [c["span_id"] for c in placeholder["children"]] == ["child"]
+
+    def test_committed_placeholder_survives_restart(self) -> None:
+        """重启前已超时落进占位节点的片段，重启后仍在占位节点下；
+        父片段在那之后补到，照旧挪回真实父片段下面。"""
+        before = TraceAssembler(max_wait_ms=3_000.0)
+        before.add_span(
+            make_span("t1", "child", "p1", "inventory", 0.0, 50.0),
+            now_ms=100_000.0,
+        )
+        tree = before.build_tree("t1", now_ms=104_000.0)  # 超过 3 秒，已归占位
+        assert tree["complete"]
+        committed = find_node(tree["roots"], f"{PLACEHOLDER_PREFIX}p1")
+        assert committed is not None and committed["committed"]
+
+        # 重启重建：接收时刻距当前已 5 秒，重建时立即归占位节点
+        after = TraceAssembler(max_wait_ms=3_000.0)
+        after.load_from_storage(
+            [(make_span("t1", "child", "p1", "inventory", 0.0, 50.0), 100_000.0)],
+            now_ms=105_000.0,
+        )
+        tree = after.build_tree("t1", now_ms=105_000.0)
+        assert tree["pending_count"] == 0
+        assert tree["complete"]
+        placeholder = find_node(tree["roots"], f"{PLACEHOLDER_PREFIX}p1")
+        assert placeholder is not None
+        assert placeholder["committed"]
+        assert [c["span_id"] for c in placeholder["children"]] == ["child"]
+
+        # 父片段补到：子片段从占位节点挪回真实父片段下
+        after.add_span(
+            make_span("t1", "p1", None, "gateway", 0.0, 100.0), now_ms=106_000.0
+        )
+        tree = after.build_tree("t1", now_ms=106_000.0)
+        parent = find_node(tree["roots"], "p1")
+        assert parent is not None
+        assert [c["span_id"] for c in parent["children"]] == ["child"]
+        assert find_node(tree["roots"], f"{PLACEHOLDER_PREFIX}p1") is None

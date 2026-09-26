@@ -72,12 +72,16 @@ class SpanStore:
             ).fetchall()
         return [SpanRecord.from_row(dict(r)) for r in rows]
 
-    def all_spans(self) -> list[SpanRecord]:
+    def all_spans_with_received_at(self) -> list[tuple[SpanRecord, float]]:
+        """取全部片段及各自的服务端接收时刻（毫秒）。
+
+        重启重建时按接收时刻回放，等待计时才能从收下那一刻连续算起。
+        """
         with self._lock:
             rows = self._conn.execute(
-                "SELECT * FROM spans ORDER BY start_time, span_id"
+                "SELECT * FROM spans ORDER BY received_at, span_id"
             ).fetchall()
-        return [SpanRecord.from_row(dict(r)) for r in rows]
+        return [(SpanRecord.from_row(dict(r)), r["received_at"]) for r in rows]
 
     def list_traces(
         self,
