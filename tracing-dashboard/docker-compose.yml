@@ -1,0 +1,22 @@
+services:
+  backend:
+    build: ./backend
+    environment:
+      # 子片段等待父片段的最长时间（秒），可按需覆盖
+      TRACING_MAX_PENDING_WAIT_SECONDS: "30"
+    volumes:
+      - tracing-data:/data
+    expose:
+      - "8000"
+    restart: unless-stopped
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "8080:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  tracing-data:
