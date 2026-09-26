@@ -163,6 +163,81 @@ class TestMissingParent:
         assert tree["span_count"] == 3
 
 
+class TestReloadWaitTimer:
+    """重启重建对等待计时透明：等待锚在持久化的 received_at 上。"""
+
+    @staticmethod
+    def _stored(span: SpanRecord, received_at: float) -> SpanRecord:
+        # 模拟从 SQLite 读出的片段：带上服务端当初收下它的时刻
+        span.received_at = received_at
+        return span
+
+    def test_pending_span_survives_reload(self) -> None:
+        """重启前没等满的片段，重启后仍处于等待状态，不能一重启就到期。"""
+        asm = TraceAssembler(max_wait_ms=3_000.0)
+        # 开始时间故意偏早两分钟（延迟上报），不能因此被判超时
+        child = self._stored(
+            make_span("t1", "child", "parent", start=-120_000.0, end=-119_900.0),
+            received_at=1_000.0,
+        )
+        # 收下 1 秒后重启
+        asm.load_from_storage([child], now_ms=2_000.0)
+
+        tree = asm.build_tree("t1", now_ms=2_000.0)
+        assert tree is not None
+        assert tree["pending_count"] == 1
+        assert not tree["complete"]
+        placeholder = find_node(tree["roots"], f"{PLACEHOLDER_PREFIX}parent")
+        assert placeholder is not None
+        assert not placeholder["committed"]  # 仍是未提交的临时挂点
+
+    def test_wait_clock_continues_across_reload(self) -> None:
+        """剩余等待连续计算：到期时刻 = 收下时刻 + 最长等待，不从重启重新计满。"""
+        # 收下 1 秒时重启，应只剩 2 秒：收下后 3.1 秒必须已到期
+        # （若从重启重新计满 3 秒，此时仍显示等待）
+        asm = TraceAssembler(max_wait_ms=3_000.0)
+        child = self._stored(make_span("t1", "child", "parent"), received_at=1_000.0)
+        asm.load_from_storage([child], now_ms=2_000.0)
+        tree = asm.build_tree("t1", now_ms=4_100.0)
+        assert tree["pending_count"] == 0
+        assert tree["complete"]
+        placeholder = find_node(tree["roots"], f"{PLACEHOLDER_PREFIX}parent")
+        assert placeholder is not None
+        assert placeholder["committed"]
+        assert [c["span_id"] for c in placeholder["children"]] == ["child"]
+
+        # 对称地，到期前一刻（收下后 2.9 秒）不能提前归占位节点
+        asm = TraceAssembler(max_wait_ms=3_000.0)
+        child = self._stored(make_span("t1", "child", "parent"), received_at=1_000.0)
+        asm.load_from_storage([child], now_ms=1_000.0)
+        tree = asm.build_tree("t1", now_ms=3_900.0)
+        assert tree["pending_count"] == 1
+        assert not tree["complete"]
+
+    def test_expired_before_reload_stays_committed(self) -> None:
+        """重启前已超时落占位节点的片段，重启后仍在占位节点下；父片段补到照旧归位。"""
+        asm = TraceAssembler(max_wait_ms=3_000.0)
+        child = self._stored(make_span("t1", "child", "parent"), received_at=1_000.0)
+        # 收下 5 秒后重启：等待早已超时
+        asm.load_from_storage([child], now_ms=5_000.0)
+
+        tree = asm.build_tree("t1", now_ms=5_000.0)
+        assert tree["pending_count"] == 0
+        assert tree["complete"]
+        placeholder = find_node(tree["roots"], f"{PLACEHOLDER_PREFIX}parent")
+        assert placeholder is not None
+        assert placeholder["committed"]
+        assert [c["span_id"] for c in placeholder["children"]] == ["child"]
+
+        # 父片段在重启后补到，子片段挪回真实父片段下
+        asm.add_span(make_span("t1", "parent", None), now_ms=6_000.0)
+        tree = asm.build_tree("t1", now_ms=6_000.0)
+        parent = find_node(tree["roots"], "parent")
+        assert parent is not None
+        assert [c["span_id"] for c in parent["children"]] == ["child"]
+        assert find_node(tree["roots"], f"{PLACEHOLDER_PREFIX}parent") is None
+
+
 class TestOrderIndependence:
     def _build_spans(self) -> list[SpanRecord]:
         return [

@@ -157,3 +157,97 @@ class TestPersistenceReload:
         svc2.close()
         assert tree_after["span_count"] == tree_before["span_count"]
         assert tree_after["critical_path"] == tree_before["critical_path"]
+
+
+class TestRestartPendingWait:
+    """重启对等待计时透明（端到端：真实 SQLite 文件 + 重建服务）。"""
+
+    def test_pending_wait_is_transparent_across_restart(self, tmp_path) -> None:
+        """最长等待 3 秒、收下 1 秒后重启：重启后仍在等待，收下约 3.5 秒后到期。"""
+        db = str(tmp_path / "trace.db")
+        cfg = Settings(database_path=db, max_pending_wait_seconds=3)
+        svc1 = TracingService(cfg)
+        # 开始/结束时间故意早两分钟，模拟客户端攒批、延迟上报
+        start = now_ms() - 120_000
+        svc1.ingest(
+            [
+                span("t1", "root", None, "gateway", start, start + 2_000),
+                span("t1", "child", "p1", "inventory", start + 100, start + 900),
+            ]
+        )
+        tree = svc1.get_tree("t1")
+        assert tree["pending_count"] == 1
+        assert not tree["complete"]
+
+        time.sleep(1.0)  # 收下 1 秒后重启
+        svc1.close()
+
+        svc2 = TracingService(cfg)
+        try:
+            # 重启后立刻查：仍在等待，不能一重启就到期
+            tree = svc2.get_tree("t1")
+            assert tree["pending_count"] == 1
+            assert not tree["complete"]
+            placeholder = next(n for n in tree["roots"] if n["type"] == "placeholder")
+            assert placeholder["committed"] is False
+
+            # 从收下算起约 3.5 秒：已到期归占位节点——剩余时间连续计算，
+            # 既不是重启瞬间到期，也不是从重启重新计满 3 秒
+            time.sleep(2.5)
+            tree = svc2.get_tree("t1")
+            assert tree["pending_count"] == 0
+            assert tree["complete"]
+            placeholder = next(n for n in tree["roots"] if n["type"] == "placeholder")
+            assert placeholder["committed"] is True
+            assert [c["span_id"] for c in placeholder["children"]] == ["child"]
+
+            # 父片段补报上来，子片段照旧挪回真实父片段下
+            svc2.ingest(
+                [span("t1", "p1", "root", "checkout", start + 50, start + 1_500)]
+            )
+            tree = svc2.get_tree("t1")
+            assert tree["complete"]
+            assert all(n["type"] != "placeholder" for n in tree["roots"])
+            root = next(n for n in tree["roots"] if n["span_id"] == "root")
+            p1 = next(c for c in root["children"] if c["span_id"] == "p1")
+            assert [c["span_id"] for c in p1["children"]] == ["child"]
+        finally:
+            svc2.close()
+
+    def test_expired_span_stays_under_placeholder_after_restart(
+        self, tmp_path
+    ) -> None:
+        """重启前已等超时落占位节点的片段，重启后仍在占位节点下。"""
+        db = str(tmp_path / "trace.db")
+        cfg = Settings(database_path=db, max_pending_wait_seconds=1)
+        svc1 = TracingService(cfg)
+        start = now_ms() - 120_000
+        svc1.ingest(
+            [span("t1", "orphan", "ghost", "inventory", start, start + 500)]
+        )
+        time.sleep(1.2)  # 等满 1 秒最长等待，重启前就已落占位节点
+        tree = svc1.get_tree("t1")
+        assert tree["complete"]
+        assert tree["roots"][0]["committed"] is True
+        svc1.close()
+
+        svc2 = TracingService(cfg)
+        try:
+            tree = svc2.get_tree("t1")
+            assert tree["pending_count"] == 0
+            assert tree["complete"]
+            placeholder = tree["roots"][0]
+            assert placeholder["type"] == "placeholder"
+            assert placeholder["committed"] is True
+            assert [c["span_id"] for c in placeholder["children"]] == ["orphan"]
+
+            # 父片段在重启后补到，照旧挪回真实父片段下
+            svc2.ingest(
+                [span("t1", "ghost", None, "gateway", start - 100, start + 1_000)]
+            )
+            tree = svc2.get_tree("t1")
+            ghost = tree["roots"][0]
+            assert ghost["span_id"] == "ghost"
+            assert [c["span_id"] for c in ghost["children"]] == ["orphan"]
+        finally:
+            svc2.close()

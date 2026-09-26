@@ -40,6 +40,7 @@ class SpanRecord:
         "start_time",
         "end_time",
         "status_code",
+        "received_at",
     )
 
     def __init__(
@@ -51,6 +52,7 @@ class SpanRecord:
         start_time: float,
         end_time: float,
         status_code: int,
+        received_at: Optional[float] = None,
     ) -> None:
         self.trace_id = trace_id
         self.span_id = span_id
@@ -59,6 +61,9 @@ class SpanRecord:
         self.start_time = start_time
         self.end_time = end_time
         self.status_code = status_code
+        # 服务端收下片段的时刻（ms），等待父片段的计时就锚在它上面；
+        # 只有从存储重建时才会带上，其它入口为 None
+        self.received_at = received_at
 
     @property
     def duration(self) -> float:
@@ -101,4 +106,5 @@ class SpanRecord:
             start_time=row["start_time"],
             end_time=row["end_time"],
             status_code=row["status_code"],
+            received_at=row["received_at"],
         )

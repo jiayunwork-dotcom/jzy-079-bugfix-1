@@ -350,12 +350,19 @@ class TraceAssembler:
                 edges.append((parent.service, child.service, child.duration))
         return edges
 
-    def load_from_storage(self, spans: list[SpanRecord]) -> None:
+    def load_from_storage(
+        self, spans: list[SpanRecord], now_ms: Optional[float] = None
+    ) -> None:
         """重启后从持久化数据重建状态。
 
-        按开始时间依次入库（正常调用里父片段总是先开始），真正缺失父编号的
-        片段随后一次性按超时归入占位节点。
+        等待计时对重启透明：挂起片段的等待起点取持久化的 received_at
+        （服务端当初收下它的时刻），到期时刻 = received_at + max_wait_ms，
+        不随重启提前或重新计满。重建后按当前时间做一次超时冲刷：
+        重启前已等满的直接归占位节点，没等满的继续等剩下的时间。
         """
+        if now_ms is None:
+            now_ms = time.time() * 1000.0
         for span in sorted(spans, key=lambda s: (s.start_time, s.span_id)):
-            self.add_span(span, now_ms=0.0)
-        self.flush_expired(now_ms=float("inf"))
+            arrived_at = span.received_at if span.received_at is not None else now_ms
+            self.add_span(span, now_ms=arrived_at)
+        self.flush_expired(now_ms)
